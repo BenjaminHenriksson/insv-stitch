@@ -1,0 +1,18 @@
+# Data directories (large files)
+DCIM/
+MISC/
+x5-ground-truth/
+archive/
+output/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
+
+# Claude
+.claude/
