@@ -427,15 +427,16 @@ class FramePipeline:
         self.verbose = verbose
         self.use_optical_flow = use_optical_flow
 
-        print(f"Building remap tables ({out_w}x{out_h}, FOV={effective_fov})...")
+        if verbose:
+            print(f"Building remap tables ({out_w}x{out_h}, FOV={effective_fov})...")
         t0 = time.time()
         self.remapper = FisheyeRemapper(
             calib, input_size, out_w, out_h, effective_fov,
             R_orientation=R_orientation,
         )
-        print(f"  Remap tables built in {time.time() - t0:.1f}s")
-
-        print("Creating blend mask...")
+        if verbose:
+            print(f"  Remap tables built in {time.time() - t0:.1f}s")
+            print("Creating blend mask...")
         self.blend_mask = self.remapper.create_blend_mask()
 
         # Precompute overlap strip regions for optical flow / seam finding
