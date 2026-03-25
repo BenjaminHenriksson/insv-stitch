@@ -65,50 +65,64 @@ The `cv2.fisheye.undistortPoints` inverse mapping shows that r=1915px (image edg
 
 **Status**: Figuring out the correct model that maps these k1-k4 values to the full 90-degree FOV remains an open problem. The coefficients likely operate in a transformed coordinate space or use a non-standard polynomial form.
 
-## .insv Footer Format
+## .insv Footer Format: SOLVED
 
-The footer is appended after the MP4 data. Structure (reading from end of file):
+Confirmed via telemetry-parser source code (AdrianEddy/telemetry-parser).
 
-```
-[...MP4 data...][...extra data sections...][entry table][total_size:4 LE][count:4 LE][magic:32 ASCII]
-```
-
-### Magic
-Last 32 bytes of file: ASCII string `8db42d694ccc418790edff439fe026bf`
-
-### Top-level footer
-- Bytes -36 to -33: entry count (uint32 LE). Observed value: 3
-- Bytes -40 to -37: total extra data size (uint32 LE, e.g. 10,460,715 for VID_005)
-
-### Entry table
-10-byte entries with `d8 cc` marker, found by scanning backwards from the footer:
+### Structure (reading backwards from end of file)
 
 ```
-[id: 2 bytes LE] [size: 4 bytes LE] [marker: d8 cc] [counter: 2 bytes LE]
+[...MP4 data...][extra data section: extra_size bytes][padding:32][extra_size:4 LE][version:4 LE][magic:32 ASCII]
 ```
 
-Data for each entry is located at: `entry_file_position - size`
+**Footer** (last 72 bytes): `[32 zero padding][extra_size: uint32 LE][version: uint32 LE][magic: 32 ASCII]`
 
-### Observed entries (VID_005, 0.57 seconds)
+### Records stored backwards
 
-| ID | Size | Description |
-|----|------|-------------|
-| 0x02 | 1,228,840 | Unknown (large, possibly thumbnail/preview) |
-| 0x03 | 16,640 | Raw IMU data (gyro + accelerometer) |
-| 0x04 | 416 | Protobuf: lens protector configurations |
-| 0x09 | 912 | Protobuf: unknown repeating structure |
-| 0x0b | 5,073 | Raw 16-bit data (constant, possibly calibration offsets) |
-| 0x16 | 8,306,836 | Unknown (large) |
-| 0x1c | 12,793 | Unknown (zeros observed at start) |
-| 0x1d | 54 | Small index/pointer table |
+Records are stored from the end of the extra data section, growing backwards. Each record has a **6-byte trailer** after its data:
 
-### Entry 0x04: Protobuf lens configurations
-Contains named lens protector profiles with associated calibration adjustments:
-- `bare`: no protector
-- `ProtectorA`, `ProtectorS`, `ProtectorAS`: physical lens protectors
-- `InvisibleDiveWater`, `InvisibleDiveAir`: underwater housing modes
+```
+[record data: size bytes][format: 1 byte][id: 1 byte][size: 4 bytes LE]
+```
 
-Each profile includes FOV and calibration offset doubles.
+The last record (closest to footer padding) is always **id=0 (Offsets)**, the index table. Parsing starts by reading the Offsets record first, at `file_end - 78 + 1`.
+
+### Offsets record (id=0)
+
+Contains 10-byte entries mapping record IDs to positions within the extra section:
+```
+[id: 1 byte][format: 1 byte][size: 4 bytes LE][offset: 4 bytes LE]
+```
+
+- `offset` is relative to `extra_start` (= `file_size - extra_size`)
+- `format`: 0=binary, 1=protobuf
+
+### Record types
+
+| ID | Name | Format | Content |
+|----|------|--------|---------|
+| 0 | Offsets | binary | Index table (always last record) |
+| 1 | Metadata | protobuf | Camera info, calibration, gyro config |
+| 2 | Thumbnail | binary | H.264 video frame |
+| 3 | Gyro | binary | IMU data (accel + gyro) |
+| 4 | Exposure | binary | Shutter speed per frame |
+| 9 | AAAData | binary | Auto-exposure data |
+| 10 | Anchors | binary | Highlights |
+| 11 | AAASimulation | binary | Unknown |
+| 22 | (large) | binary | Unknown (8.3MB for 0.57s clip) |
+| 28 | (unknown) | binary | Unknown |
+| 29 | (unknown) | binary | Small (54 bytes) |
+
+### VID_005 offsets table (31 entries, 310 bytes)
+
+```
+id= 1 fmt=1 size=3995      offset=10456326   (metadata protobuf)
+id= 2 fmt=0 size=1228840   offset=9227480    (thumbnail)
+id= 3 fmt=0 size=16640     offset=9096408    (IMU: 832 records × 20 bytes)
+id= 4 fmt=0 size=416       offset=8965336    (exposure)
+id= 9 fmt=0 size=912       offset=8834264    (AAA data)
+id=22 fmt=0 size=8306836   offset=314584     (unknown, large)
+```
 
 ## IMU Data: SOLVED via telemetry-parser
 
