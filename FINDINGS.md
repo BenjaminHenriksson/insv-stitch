@@ -110,23 +110,43 @@ Contains named lens protector profiles with associated calibration adjustments:
 
 Each profile includes FOV and calibration offset doubles.
 
-## IMU Data (Entry 0x03)
+## IMU Data: SOLVED via telemetry-parser
 
-### Format
-- **Encoding**: Raw 16-bit unsigned integers (uint16 LE)
-- **NOT** the documented double-precision format from older Insta360 models
-- 8,320 uint16 values for a 0.57-second clip = ~14,596 values/second
-- Values cluster around 30,600-31,400 (slowly varying, consistent with stationary camera)
+The `telemetry-parser` Python package (v0.3.0, `uv pip install telemetry-parser`) successfully parses X5 IMU data.
 
-### Unknown parameters
-- Record stride (how many uint16 values per sample), no clear channel separation found
-- IMU zero-offset and sensitivity (counts per rad/s, counts per m/s^2)
-- Which values are gyroscope vs accelerometer
-- Timestamp encoding (if any; may be implicit at fixed sample rate)
+### Usage
+```python
+from telemetry_parser.telemetry_parser import Parser
+p = Parser("/absolute/path/to/file.insv")
+print(p.camera, p.model)  # "Insta360", "Insta360 X5"
+imu = p.normalized_imu()  # list of dicts with timestamp_ms, accl, gyro, magn
+meta = p.telemetry()[0]['Default']['Metadata']
+```
 
-### Entry 0x0b: Related IMU data?
-- 2,536 uint16 values, constant at 35,703 (0x8B77)
-- Possibly static calibration offsets or data from the other lens's IMU
+### IMU configuration (from protobuf metadata)
+- **acc_range**: 32 (±32g accelerometer)
+- **gyro_range**: 2000 (±2000 deg/s gyroscope)
+- **gyro_calib**: 6 floats = gyroscope bias offsets (rad/s): `[7.4e-5, 0.00257, 0.01828, -0.00440, 0.00235, 0.00577]`
+- **Sample rate**: ~1000 Hz (996 Hz measured for VID_005)
+- **first_frame_timestamp**: ms offset from recording start to first video frame
+
+### Normalized IMU output
+Each sample: `{timestamp_ms, accl: (x,y,z), gyro: (x,y,z), magn: None}`
+- Accel in m/s², gyro in deg/s
+- Timestamps relative to first video frame (negative = before recording)
+- Axis mapping for X5: "yzX" (applied internally by telemetry-parser)
+
+### Gravity-derived orientation per file
+
+| File | Samples | Accel at t=0 (m/s²) | |a| | Pitch | Roll |
+|------|---------|---------------------|-----|-------|------|
+| VID_002 | 167,392 | (4.25, 8.12, -1.15) | 9.24 | 27.4° | 98.1° |
+| VID_003 | 3,328 | (5.25, 7.55, 0.15) | 9.20 | 34.8° | 88.9° |
+| VID_004 | 852,752 | (-0.40, 10.11, -0.24) | 10.12 | -2.3° | 91.4° |
+| VID_005 | 832 | (10.76, 6.02, 6.54) | 13.95 | 50.4° | 42.6° |
+
+VID_004 is the most level (pitch≈0°, roll≈90° = camera held vertically in selfie mode).
+VID_005 was being actively moved (|a|=13.95 >> 9.81, high gyro rates).
 
 ## Orientation / Gyroscope
 
@@ -197,7 +217,7 @@ Files in `x5-ground-truth/` are Insta360 Studio exports:
 ## Open Questions
 
 1. **Distortion model**: What is the correct projection model for the X5's k1-k4 coefficients?
-2. **IMU decoding**: What is the record structure, sample rate, and calibration of the raw 16-bit IMU data?
-3. **Photo orientation**: Photos don't have a matching .pb file. Is the gyro/orientation data embedded in the JPEG EXIF?
-4. **Per-frame orientation**: For video, does orientation change per frame (requires gyro integration) or is it constant?
-5. **GT stitching approach**: What blend/seam strategy does Insta360 Studio use to achieve clean stitching at distance?
+2. **Photo orientation**: .insp files have footers too (confirmed). Does telemetry-parser handle them?
+3. **Gravity → rotation matrix**: The gravity vector gives pitch/roll but NOT yaw. Yaw must come from gyro integration or a stored reference direction.
+4. **GT stitching approach**: What blend/seam strategy does Insta360 Studio use to achieve clean stitching at distance?
+5. **Mapping gyro orientation to equirectangular rotation**: The axis conventions between IMU frame, camera frame, and equirectangular frame need to be worked out.
