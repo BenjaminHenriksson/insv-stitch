@@ -150,6 +150,18 @@ Each sample: `{timestamp_ms, accl: (x,y,z), gyro: (x,y,z), magn: None}`
 - Timestamps relative to first video frame (negative = before recording)
 - Axis mapping for X5: "yzX" (applied internally by telemetry-parser)
 
+### IMU → equirectangular axis mapping
+
+Determined empirically by comparing brute-force rotation's implied gravity with IMU readings, validated on VID_004 (stationary, gravity maps to (0.023, -0.999, 0.036) ≈ world down):
+
+```
+equirect_x = -imu_z
+equirect_y = -imu_y
+equirect_z = -imu_x
+```
+
+Or: `g_equirect = (-accel_imu[2], -accel_imu[1], -accel_imu[0])` after telemetry-parser's "yzX" remap.
+
 ### Gravity-derived orientation per file
 
 | File | Samples | Accel at t=0 (m/s²) | |a| | Pitch | Roll |
@@ -230,8 +242,8 @@ Files in `x5-ground-truth/` are Insta360 Studio exports:
 
 ## Open Questions
 
-1. **Distortion model**: What is the correct projection model for the X5's k1-k4 coefficients?
-2. **Photo orientation**: .insp files have footers too (confirmed). Does telemetry-parser handle them?
-3. **Gravity → rotation matrix**: The gravity vector gives pitch/roll but NOT yaw. Yaw must come from gyro integration or a stored reference direction.
-4. **GT stitching approach**: What blend/seam strategy does Insta360 Studio use to achieve clean stitching at distance?
-5. **Mapping gyro orientation to equirectangular rotation**: The axis conventions between IMU frame, camera frame, and equirectangular frame need to be worked out.
+1. **Distortion model**: SOLVED. Unified Camera Model (UCM) with xi=2.0. MAE improved 18.32→16.80.
+2. **Photo orientation**: .insp files have footers too (confirmed). telemetry-parser TBD.
+3. **Gravity → rotation matrix**: Axis mapping solved. Gravity gives pitch/roll; yaw needs GT or magnetometer. For fast-moving cameras, gyro integration from a stationary window is needed.
+4. **Sensor fusion**: Proper complementary/Kalman filter for accel+gyro fusion would improve orientation for moving cameras.
+5. **GT stitching approach**: What blend/seam strategy does Insta360 Studio use to achieve clean stitching at distance?
