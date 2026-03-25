@@ -36,6 +36,7 @@ class LensCalibration:
     pitch_deg: float
     half_fov_deg: float
     rotation: np.ndarray  # Rodrigues vector (3,)
+    xi: float = 2.0  # Unified Camera Model parameter
     k1: float = 0.0
     k2: float = 0.0
     k3: float = 0.0
@@ -203,6 +204,7 @@ class CalibrationData:
                 yaw_deg=lens.yaw_deg, pitch_deg=lens.pitch_deg,
                 half_fov_deg=lens.half_fov_deg,
                 rotation=lens.rotation.copy(),
+                xi=lens.xi,
                 k1=lens.k1, k2=lens.k2, k3=lens.k3, k4=lens.k4,
                 p1=lens.p1, p2=lens.p2,
             )
@@ -241,6 +243,7 @@ class FisheyeRemapper:
         self.out_h = out_h
         self.effective_half_fov = np.radians(effective_fov_deg / 2)
         self.R_orientation = R_orientation  # optional gyro/manual orientation correction
+        self.xi = calib.lens_back.xi  # UCM parameter (same for both lenses)
 
         # Scale calibration to input resolution
         self.scaled = calib.scale_to(input_size)
@@ -326,6 +329,14 @@ class FisheyeRemapper:
                       lens: LensCalibration):
         """Project 3D points to fisheye pixel coordinates for one lens.
 
+        Uses the Unified Camera Model (UCM) with xi parameter:
+        1. Transform to camera coords
+        2. Normalize to unit sphere
+        3. Shift by xi along optical axis
+        4. Perspective projection
+        5. Radial/tangential distortion
+        6. Scale by focal length
+
         Returns: map_x, map_y (float32), valid_mask (bool)
         """
         h, w = P.shape[:2]
@@ -338,35 +349,40 @@ class FisheyeRemapper:
         Pc_y = Pc[..., 1]
         Pc_z = Pc[..., 2]
 
-        # Angle from optical axis
-        r_xy = np.sqrt(Pc_x**2 + Pc_y**2)
-        theta = np.arctan2(r_xy, Pc_z)
-        # Negate Pc_y to convert from world Y-up to image Y-down (OpenCV convention)
-        phi = np.arctan2(-Pc_y, Pc_x)
-
-        # Valid mask: within effective FOV
-        # Note: no Pc_z > 0 check. Fisheye covers beyond 180° (theta > 90°).
+        # Angle from optical axis (for validity check)
+        theta = np.arctan2(np.sqrt(Pc_x**2 + Pc_y**2), Pc_z)
         valid = theta < self.effective_half_fov
 
-        # Equidistant fisheye projection
-        # f_equi derived from: at the image circle edge, r_pixels = f * theta_max
-        # Use the lens center to estimate the inscribed circle radius
-        radius = min(lens.cx, lens.cy,
-                     self.input_size - lens.cx, self.input_size - lens.cy)
-        f_equi = radius / self.effective_half_fov
+        # UCM projection: normalize to unit sphere then shift by xi
+        norm = np.sqrt(Pc_x**2 + Pc_y**2 + Pc_z**2)
+        norm = np.maximum(norm, 1e-10)
+        Xs = Pc_x / norm
+        Ys = -Pc_y / norm  # negate Y: world Y-up → image Y-down
+        Zs = Pc_z / norm
 
-        r_pix = f_equi * theta
+        # Perspective projection through shifted sphere
+        denom = Zs + self.xi
+        valid = valid & (denom > 1e-6)
+        denom = np.maximum(denom, 1e-6)
+
+        xp = Xs / denom
+        yp = Ys / denom
+
+        # Radial + tangential distortion
+        r2 = xp * xp + yp * yp
+        radial = 1.0 + lens.k1 * r2 + lens.k2 * r2 * r2 + lens.k3 * r2 * r2 * r2
+        xd = xp * radial + 2 * lens.p1 * xp * yp + lens.p2 * (r2 + 2 * xp * xp)
+        yd = yp * radial + lens.p1 * (r2 + 2 * yp * yp) + 2 * lens.p2 * xp * yp
 
         # Pixel coordinates
-        map_x = (lens.cx + r_pix * np.cos(phi)).astype(np.float32)
-        map_y = (lens.cy + r_pix * np.sin(phi)).astype(np.float32)
+        map_x = (lens.fx * xd + lens.cx).astype(np.float32)
+        map_y = (lens.fy * yd + lens.cy).astype(np.float32)
 
         # Invalidate out-of-bounds pixels
         oob = (map_x < 0) | (map_x >= self.input_size) | \
               (map_y < 0) | (map_y >= self.input_size)
         valid = valid & ~oob
 
-        # Set invalid pixels to -1
         map_x[~valid] = -1
         map_y[~valid] = -1
 
