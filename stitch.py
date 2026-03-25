@@ -544,85 +544,126 @@ class FramePipeline:
         return cv2.remap(eq_front, map_x, map_y, cv2.INTER_LINEAR,
                          borderMode=cv2.BORDER_REPLICATE)
 
-    def _find_seam_mask(self, eq_back, eq_front_warped):
-        """Find optimal seam through overlap using dynamic programming.
+    def _find_seam_mask(self, eq_back, eq_front):
+        """Find content-aware seam across the full overlap zone.
 
-        Returns a mask: 0=back, 1=front, with narrow feather at the seam.
+        The overlap zone curves across the image (not just vertical strips).
+        For each row, finds the overlap columns and runs a per-pixel cost
+        comparison, then uses DP to find a globally optimal seam path.
+        Moderate sigmoid feathering (30px) hides the transition.
         """
         h, w = eq_back.shape[:2]
+        overlap = self.remapper.overlap_mask  # (h, w) bool
+
+        # Cost: color difference + edge penalty (full image, masked to overlap)
+        color_diff = np.sum(np.abs(eq_back.astype(np.float32) - eq_front.astype(np.float32)), axis=2)
+        gray_b = cv2.cvtColor(eq_back, cv2.COLOR_BGR2GRAY)
+        gray_f = cv2.cvtColor(eq_front, cv2.COLOR_BGR2GRAY)
+        edges = np.sqrt(
+            cv2.Sobel(gray_b, cv2.CV_32F, 1, 0, ksize=3)**2 +
+            cv2.Sobel(gray_b, cv2.CV_32F, 0, 1, ksize=3)**2 +
+            cv2.Sobel(gray_f, cv2.CV_32F, 1, 0, ksize=3)**2 +
+            cv2.Sobel(gray_f, cv2.CV_32F, 0, 1, ksize=3)**2
+        )
+        if edges.max() > 0:
+            edges = edges / edges.max() * max(color_diff[overlap].max(), 1)
+        cost = color_diff + edges
+
+        # For each row, find the overlap column range
+        # Then run DP seam through the overlap, following the curved boundary
+        # Use the blend_mask midpoint (0.5) as the seam center hint
         mask = self.blend_mask.copy()
+        feather_px = 30
 
+        # Find per-row overlap bounds
+        row_bounds = []
+        for y in range(h):
+            cols = np.where(overlap[y])[0]
+            if len(cols) < 3:
+                row_bounds.append(None)
+            else:
+                # Split into separate regions (there may be 2 seam zones)
+                diffs = np.diff(cols)
+                gaps = np.where(diffs > 10)[0]
+                regions = []
+                prev = 0
+                for g in gaps:
+                    regions.append((cols[prev], cols[g] + 1))
+                    prev = g + 1
+                regions.append((cols[prev], cols[-1] + 1))
+                row_bounds.append(regions)
+
+        # Process each seam zone separately
+        # Identify seam zones by clustering overlap regions across rows
+        # Simple approach: use the equator regions as reference, then track each
         for x_start, x_end in self._overlap_regions:
-            strip_back = eq_back[:, x_start:x_end].astype(np.float32)
-            strip_front = eq_front_warped[:, x_start:x_end].astype(np.float32)
-            sw = strip_back.shape[1]
+            # Expand strip to cover the full vertical extent of this seam zone
+            # Find the widest column range across all rows near this equator region
+            col_min, col_max = x_start, x_end
+            for y in range(h):
+                if row_bounds[y] is None:
+                    continue
+                for (c0, c1) in row_bounds[y]:
+                    # Does this row's region overlap with our equator reference?
+                    if c0 < x_end + 50 and c1 > x_start - 50:
+                        col_min = min(col_min, c0)
+                        col_max = max(col_max, c1)
 
-            # Cost = color difference + edge penalty
-            # Color diff: penalize crossing areas where the two images disagree
-            color_diff = np.sum(np.abs(strip_back - strip_front), axis=2)
+            margin = 20
+            col_min = max(0, col_min - margin)
+            col_max = min(w, col_max + margin)
+            sw = col_max - col_min
 
-            # Edge penalty: penalize crossing strong edges in either image
-            # (wires, fence posts, any high-contrast feature)
-            gray_b = cv2.cvtColor(strip_back.astype(np.uint8), cv2.COLOR_BGR2GRAY)
-            gray_f = cv2.cvtColor(strip_front.astype(np.uint8), cv2.COLOR_BGR2GRAY)
-            edges_b = cv2.Sobel(gray_b, cv2.CV_32F, 1, 0, ksize=3)**2 + \
-                      cv2.Sobel(gray_b, cv2.CV_32F, 0, 1, ksize=3)**2
-            edges_f = cv2.Sobel(gray_f, cv2.CV_32F, 1, 0, ksize=3)**2 + \
-                      cv2.Sobel(gray_f, cv2.CV_32F, 0, 1, ksize=3)**2
-            edge_cost = np.sqrt(edges_b + edges_f)
+            # Extract strip cost
+            strip_cost = cost[:, col_min:col_max].copy()
+            strip_overlap = overlap[:, col_min:col_max]
+            # High cost outside overlap (don't let seam go there)
+            strip_cost[~strip_overlap] = strip_cost[strip_overlap].max() * 10 if strip_overlap.any() else 1e6
 
-            # Normalize edge cost to same scale as color diff
-            if edge_cost.max() > 0:
-                edge_cost = edge_cost / edge_cost.max() * color_diff.max()
-
-            cost = color_diff + edge_cost
-
-            # DP: find minimum-cost vertical path from top to bottom
-            # Vectorized: for each row, take min of (left, center, right) from previous row
-            dp = np.zeros_like(cost)
-            dp[0] = cost[0]
+            # DP seam
+            dp = np.full_like(strip_cost, np.inf)
+            dp[0] = strip_cost[0]
             path = np.zeros((h, sw), dtype=np.int32)
 
             for y in range(1, h):
-                # Shift left, center, right
                 center = dp[y - 1]
                 left = np.full(sw, np.inf)
                 left[1:] = dp[y - 1, :-1]
                 right = np.full(sw, np.inf)
                 right[:-1] = dp[y - 1, 1:]
-
                 choices = np.stack([left, center, right], axis=0)
-                best_idx = np.argmin(choices, axis=0)  # 0=left, 1=center, 2=right
-                dp[y] = cost[y] + np.min(choices, axis=0)
-                path[y] = np.arange(sw) + (best_idx - 1)  # offset: -1, 0, +1
-                path[y] = np.clip(path[y], 0, sw - 1)
+                best_idx = np.argmin(choices, axis=0)
+                dp[y] = strip_cost[y] + np.min(choices, axis=0)
+                path[y] = np.clip(np.arange(sw) + (best_idx - 1), 0, sw - 1)
 
-            # Backtrack to find the seam path
             seam = np.zeros(h, dtype=np.int32)
             seam[h - 1] = np.argmin(dp[h - 1])
             for y in range(h - 2, -1, -1):
                 seam[y] = path[y + 1, seam[y + 1]]
 
-            # Determine direction: check blend_mask at left and right edges of strip
-            left_val = self.blend_mask[h // 2, x_start]
-            right_val = self.blend_mask[h // 2, x_end - 1]
+            # Direction
+            left_val = self.blend_mask[h // 2, col_min]
+            right_val = self.blend_mask[h // 2, col_max - 1]
 
-            # Build binary mask from seam path
+            # Sigmoid feather around seam
             strip_mask = np.zeros((h, sw), dtype=np.float32)
-            if left_val < right_val:
-                # Left=back(0), right=front(1): right side of seam = front
-                for y in range(h):
-                    strip_mask[y, seam[y]:] = 1.0
-            else:
-                # Left=front(1), right=back(0): left side of seam = front
-                for y in range(h):
-                    strip_mask[y, :seam[y] + 1] = 1.0
+            xs = np.arange(sw, dtype=np.float32)
+            for y in range(h):
+                dist = xs - seam[y]
+                if left_val >= right_val:
+                    dist = -dist
+                strip_mask[y] = 1.0 / (1.0 + np.exp(-dist / max(feather_px / 4, 1)))
 
-            # Narrow feather: blur the binary mask
-            strip_mask = cv2.GaussianBlur(strip_mask, (7, 7), 1.5)
+            strip_mask = cv2.GaussianBlur(strip_mask, (1, 15), 4)
 
-            # Write into the full mask
-            mask[:, x_start:x_end] = strip_mask
+            # Only apply seam within the overlap. Blend with distance-transform.
+            # mask outside overlap to avoid black patches at lens boundaries
+            strip_blend = mask[:, col_min:col_max]
+            strip_ol = strip_overlap.astype(np.float32)
+            # Smooth the overlap boundary
+            strip_ol = cv2.GaussianBlur(strip_ol, (31, 31), 10)
+            # Merge: seam inside overlap, distance-transform outside
+            mask[:, col_min:col_max] = strip_mask * strip_ol + strip_blend * (1 - strip_ol)
 
         return mask
 
@@ -707,9 +748,12 @@ class FramePipeline:
             eq_front = self._flow_align_overlap(eq_back, eq_front)
             timings["flow"] = time.time() - t
 
-        # 3. Multi-band blend (Laplacian pyramid)
+        # 3. Blend using distance-transform mask
         t = time.time()
-        result = self._multiband_blend(eq_back, eq_front, self.blend_mask)
+        m3 = self.blend_mask[..., np.newaxis]
+        result = (eq_back.astype(np.float32) * (1 - m3) +
+                  eq_front.astype(np.float32) * m3)
+        result = np.clip(result, 0, 255).astype(np.uint8)
         timings["blend"] = time.time() - t
 
         timings["total"] = time.time() - t_start
