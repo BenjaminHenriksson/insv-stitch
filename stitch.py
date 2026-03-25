@@ -484,35 +484,44 @@ class FramePipeline:
         return result
 
     def _flow_align_overlap(self, eq_back, eq_front):
-        """Warp eq_front to align with eq_back using attenuated optical flow.
+        """Warp eq_front to align with eq_back using optical flow in overlap strips.
 
-        Computes flow on the full image (for context), then attenuates it
-        using the blend mask so it's only applied in the overlap zone.
-        weight = 4 * mask * (1 - mask): peaks at 1.0 at the seam (mask=0.5),
-        zero at single-lens regions (mask=0 or 1).
+        Computes flow only where both lenses have valid data (overlap regions),
+        then smoothly attenuates it to zero at the strip edges.
         """
-        gray_back = cv2.cvtColor(eq_back, cv2.COLOR_BGR2GRAY)
-        gray_front = cv2.cvtColor(eq_front, cv2.COLOR_BGR2GRAY)
+        h, w = eq_front.shape[:2]
+        flow = np.zeros((h, w, 2), dtype=np.float32)
 
-        flow = cv2.calcOpticalFlowFarneback(
-            gray_back, gray_front, None,
-            pyr_scale=0.5, levels=5, winsize=13,
-            iterations=10, poly_n=7, poly_sigma=1.5, flags=0,
-        )
+        for x_start, x_end in self._overlap_regions:
+            # Crop overlap strips
+            strip_back = eq_back[:, x_start:x_end]
+            strip_front = eq_front[:, x_start:x_end]
 
-        # Clamp extreme flow values
-        mag = np.sqrt(flow[..., 0]**2 + flow[..., 1]**2)
-        clamp = np.minimum(30.0 / (mag + 1e-6), 1.0)
-        flow[..., 0] *= clamp
-        flow[..., 1] *= clamp
+            gray_b = cv2.cvtColor(strip_back, cv2.COLOR_BGR2GRAY)
+            gray_f = cv2.cvtColor(strip_front, cv2.COLOR_BGR2GRAY)
 
-        # Attenuate: apply flow only in the overlap zone
-        weight = 4.0 * self.blend_mask * (1.0 - self.blend_mask)
-        flow[..., 0] *= weight
-        flow[..., 1] *= weight
+            # Compute flow on the strip only (no black regions)
+            strip_flow = cv2.calcOpticalFlowFarneback(
+                gray_b, gray_f, None,
+                pyr_scale=0.5, levels=5, winsize=13,
+                iterations=10, poly_n=7, poly_sigma=1.5, flags=0,
+            )
+
+            # Clamp extreme flow
+            mag = np.sqrt(strip_flow[..., 0]**2 + strip_flow[..., 1]**2)
+            clamp = np.minimum(20.0 / (mag + 1e-6), 1.0)
+            strip_flow[..., 0] *= clamp
+            strip_flow[..., 1] *= clamp
+
+            # Attenuate using blend mask within this strip
+            strip_mask = self.blend_mask[:, x_start:x_end]
+            weight = 4.0 * strip_mask * (1.0 - strip_mask)
+            strip_flow[..., 0] *= weight
+            strip_flow[..., 1] *= weight
+
+            flow[:, x_start:x_end] = strip_flow
 
         # Warp front to align with back
-        h, w = eq_front.shape[:2]
         map_x = np.arange(w, dtype=np.float32)[None, :] + flow[..., 0]
         map_y = np.arange(h, dtype=np.float32)[:, None] + flow[..., 1]
 
@@ -601,6 +610,57 @@ class FramePipeline:
 
         return mask
 
+    @staticmethod
+    def _multiband_blend(img_a: np.ndarray, img_b: np.ndarray,
+                         mask: np.ndarray, levels: int = 5) -> np.ndarray:
+        """Multi-band blend using Laplacian pyramids.
+
+        Blends low frequencies with wide transition (smooth color)
+        and high frequencies with narrow transition (sharp features, less ghosting).
+        """
+        a = img_a.astype(np.float32)
+        b = img_b.astype(np.float32)
+        m = mask.astype(np.float32)
+
+        # Build Gaussian pyramids for mask
+        gp_mask = [m]
+        for _ in range(levels):
+            m = cv2.pyrDown(m)
+            gp_mask.append(m)
+
+        # Build Laplacian pyramids for images
+        lp_a = []
+        lp_b = []
+        ga, gb = a, b
+        for i in range(levels):
+            ga_down = cv2.pyrDown(ga)
+            gb_down = cv2.pyrDown(gb)
+            lp_a.append(ga - cv2.pyrUp(ga_down, dstsize=(ga.shape[1], ga.shape[0])))
+            lp_b.append(gb - cv2.pyrUp(gb_down, dstsize=(gb.shape[1], gb.shape[0])))
+            ga, gb = ga_down, gb_down
+        # Coarsest level (residual)
+        lp_a.append(ga)
+        lp_b.append(gb)
+
+        # Blend each level
+        blended = []
+        for la, lb, gm in zip(lp_a, lp_b, gp_mask):
+            gm3 = gm[..., np.newaxis] if gm.ndim == 2 else gm
+            if gm3.shape[:2] != la.shape[:2]:
+                gm3 = cv2.resize(gm3, (la.shape[1], la.shape[0]))[..., np.newaxis] \
+                       if gm3.ndim == 2 else cv2.resize(gm3, (la.shape[1], la.shape[0]))
+                if gm3.ndim == 2:
+                    gm3 = gm3[..., np.newaxis]
+            blended.append(la * (1 - gm3) + lb * gm3)
+
+        # Reconstruct from coarsest to finest
+        result = blended[-1]
+        for i in range(levels - 1, -1, -1):
+            result = cv2.pyrUp(result, dstsize=(blended[i].shape[1], blended[i].shape[0]))
+            result += blended[i]
+
+        return np.clip(result, 0, 255).astype(np.uint8)
+
     def process(self, frame_back: np.ndarray, frame_front: np.ndarray,
                 debug_dir: str = None) -> np.ndarray:
         """Process one frame pair into equirectangular output."""
@@ -628,40 +688,13 @@ class FramePipeline:
         # 2. Optical flow alignment in overlap zones
         if self.use_optical_flow:
             t = time.time()
-            eq_front_warped = self._flow_align_overlap(eq_back, eq_front)
+            eq_front = self._flow_align_overlap(eq_back, eq_front)
             timings["flow"] = time.time() - t
 
-            if debug_dir:
-                # Visualize flow effect: difference before vs after
-                diff_before = cv2.absdiff(eq_back, eq_front)
-                diff_after = cv2.absdiff(eq_back, eq_front_warped)
-                cv2.imwrite(f"{debug_dir}/05_diff_before_flow.jpg", diff_before)
-                cv2.imwrite(f"{debug_dir}/06_diff_after_flow.jpg", diff_after)
-
-            # 3. Find optimal seam through overlap
-            t = time.time()
-            seam_mask = self._find_seam_mask(eq_back, eq_front_warped)
-            timings["seam"] = time.time() - t
-
-            if debug_dir:
-                cv2.imwrite(f"{debug_dir}/07_seam_mask.png",
-                            (seam_mask * 255).astype(np.uint8))
-
-            # 4. Composite using seam mask
-            t = time.time()
-            m3 = seam_mask[..., np.newaxis]
-            result = (eq_back.astype(np.float32) * (1 - m3) +
-                      eq_front_warped.astype(np.float32) * m3)
-            result = np.clip(result, 0, 255).astype(np.uint8)
-            timings["composite"] = time.time() - t
-        else:
-            # Fallback: distance-transform blend (no flow)
-            t = time.time()
-            m3 = self.blend_mask[..., np.newaxis]
-            result = (eq_back.astype(np.float32) * (1 - m3) +
-                      eq_front.astype(np.float32) * m3)
-            result = np.clip(result, 0, 255).astype(np.uint8)
-            timings["blend"] = time.time() - t
+        # 3. Multi-band blend (Laplacian pyramid)
+        t = time.time()
+        result = self._multiband_blend(eq_back, eq_front, self.blend_mask)
+        timings["blend"] = time.time() - t
 
         timings["total"] = time.time() - t_start
         self.frame_count += 1
