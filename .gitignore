@@ -1,18 +1,16 @@
-# Data directories (large files)
+# Data files (large, not for version control)
 DCIM/
 MISC/
-x5-ground-truth/
-archive/
-output/
+x5-ground-truth-output/
 
 # Python
-.venv/
 __pycache__/
 *.pyc
 
-# IDE
-.vscode/
-.idea/
+# Backups
+x5_pipeline_backup_*.py
 
-# Claude
-.claude/
+# Output files
+*.jpg
+*.mp4
+*.png
