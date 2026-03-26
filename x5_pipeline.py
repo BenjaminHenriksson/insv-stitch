@@ -262,11 +262,15 @@ def extract_metadata(insv_path: str) -> PipelineMetadata:
 # 3. IMU Stabilization
 # ============================================================
 
-# IMU-to-camera rotation matrix for X5.
-# Optimized across multiple videos (003, 002) to avoid single-video overfitting.
-# The IMU sensor is mounted at a non-trivial angle (~120° from identity) on the
-# X5 PCB; this rotation maps normalized_imu() output to the stitching camera
-# frame (X=right, Y=down, Z=forward).
+# IMU-to-camera rotation for the X5.
+# Solved via Wahba's method from GT-aligned gravity vectors across two videos
+# on one specific X5 unit. Maps normalized_imu() output to the camera frame
+# (X=right, Y=down, Z=forward). The IMU sits at ~120 degrees from identity
+# on the PCB.
+#
+# Specific to one camera. Unit-to-unit PCB mounting variation will degrade
+# stabilization on other X5s. Use --no-stab, or re-solve against a Studio
+# render from your own hardware.
 IMU_TO_CAM = np.array([
     [-0.5678,  0.4608, -0.6821],
     [ 0.7642,  0.6031, -0.2287],

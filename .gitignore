@@ -2,8 +2,12 @@
 DCIM/
 MISC/
 x5-ground-truth-output/
+x5-ground-truth/
+archive/
+output/
 
 # Python
+.venv/
 __pycache__/
 *.pyc
 
@@ -14,3 +18,13 @@ x5_pipeline_backup_*.py
 *.jpg
 *.mp4
 *.png
+
+# IDE
+.vscode/
+.idea/
+
+# Claude
+.claude/
+
+# Private notes
+TODO.md
